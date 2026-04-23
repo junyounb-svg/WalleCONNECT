@@ -3,16 +3,14 @@ using UnityEngine;
 /// <summary>
 /// Controls the Digital Swoop interaction:
 ///
-///   SPACEBAR            → Tab swoops from the computer position onto the wall beside the sensor.
-///   P2 enters 3.3 m     → Tab smoothly follows P2 (X-axis only).
-///   P2 enters 1.2 m     → Tab pans to the midpoint between sensor and P2.
-///   P2 exits  2.2 m     → Tab returns smoothly to its home position beside the sensor.
+///   SPACEBAR                          → Tab pops up beside the sensor (home).
+///   P2.x drops below entry (1.7)      → Tab follows P2 smoothly.
+///   P2.x drops below intimate (0.5)   → Tab moves to midpoint between home and P2.
+///   P2.x rises above exit (0) AFTER
+///     having reached x ≤ exit         → Tab returns home.
 ///
-/// The tab's Y and Z are fixed at all times — only X moves.
-///
-/// SETUP:
-///   • person1Transform  → An empty GameObject placed at the camera/sensor position (fixed).
-///   • person2Anchor     → A PersonAnchor tracking Person 2 (Brekel body ID 0 or 1).
+/// Movement uses SmoothDamp for an organic bell-curve velocity feel
+/// (slow start → fast mid → slow arrival).
 /// </summary>
 public class DigitalTabController : MonoBehaviour
 {
@@ -21,72 +19,82 @@ public class DigitalTabController : MonoBehaviour
     // -------------------------------------------------------------------------
 
     [Header("Positions")]
-    [Tooltip("Empty GameObject placed at the CONNECT camera / sensor position (fixed, no tracking script needed)")]
+    [Tooltip("Empty GameObject at the CONNECT camera / sensor position (fixed)")]
     public Transform person1Transform;
 
-    [Tooltip("PersonAnchor component tracking Person 2")]
+    [Tooltip("PersonAnchor component on InvisibleAnchor_P2")]
     public PersonAnchor person2Anchor;
 
     [Header("Tab Position")]
     [Tooltip("Fixed Y height of the tab on the wall — never changes")]
     public float tabFixedY = 1.5f;
 
-    [Tooltip("Fixed Z depth of the tab (the wall plane Z value in world space)")]
+    [Tooltip("Fixed Z depth of the tab (wall plane Z value in world space)")]
     public float tabFixedZ = 0f;
 
-    [Tooltip("X offset from the sensor for the home position (positive = to sensor's right)")]
+    [Tooltip("X offset from the sensor for the home position")]
     public float homeXOffset = 0.5f;
 
-    [Header("Movement")]
-    [Tooltip("Lerp speed for all smooth X movements. Higher = snappier; ~3 is a gentle glide")]
-    public float moveSpeed = 3f;
+    [Header("Movement Feel")]
+    [Tooltip("Approx time to reach target (seconds). Lower = snappier. Try 0.15 for 0.3-0.4 s reach")]
+    public float smoothTime = 0.15f;
+
+    [Tooltip("Maximum movement speed (units/sec) — caps the SmoothDamp velocity")]
+    public float maxSpeed = 20f;
 
     [Header("Swoop Animation")]
-    [Tooltip("Transform representing the computer/laptop screen position (swoop source)")]
-    public Transform swoopStartPoint;
+    [Tooltip("How far below the resting position the tab starts its rise (metres)")]
+    public float verticalRiseDistance = 0.4f;
 
     [Tooltip("Duration of the swoop-in animation in seconds")]
-    public float swoopDuration = 1.2f;
+    public float swoopDuration = 0.4f;
 
-    [Tooltip("Easing curve for the swoop (x = normalized time 0-1, y = progress 0-1)")]
+    [Tooltip("Easing curve for the swoop")]
     public AnimationCurve swoopCurve = AnimationCurve.EaseInOut(0f, 0f, 1f, 1f);
 
-    [Header("Proximity Thresholds (metres)")]
-    [Tooltip("P2 enters this radius from the sensor → tab begins following P2")]
-    public float wideProximity = 3.3f;
+    [Header("Proximity Thresholds (World X Position)")]
+    [Tooltip("P2's X drops below this → tab starts following")]
+    public float entryXThreshold = 1.7f;
 
-    [Tooltip("P2 enters this radius from the sensor → tab moves to midpoint")]
-    public float intimateProximity = 1.2f;
+    [Tooltip("P2's X drops below this → tab moves to midpoint between home and P2")]
+    public float intimateXThreshold = 0.5f;
 
-    [Tooltip("P2 exits this radius from the sensor → tab returns home (hysteresis buffer)")]
-    public float exitProximity = 2.2f;
+    [Tooltip("Tab returns home only after P2 has reached this X and then retreats back above it")]
+    public float exitXThreshold = 0f;
 
     // -------------------------------------------------------------------------
     //  State machine
     // -------------------------------------------------------------------------
     private enum TabState
     {
-        Hidden,         // before spacebar — tab is invisible
-        SwoopingIn,     // animating from computer position to wall
-        AtWall,         // resting beside the sensor, waiting for P2
-        FollowingP2,    // tracking P2's X
-        AtMidpoint,     // locked to midpoint of sensor and P2
-        ReturningHome   // lerping back to sensor side
+        Hidden,
+        SwoopingIn,
+        AtWall,
+        FollowingP2,
+        AtMidpoint,
+        ReturningHome
     }
 
-    private TabState _state = TabState.Hidden;
-
+    private TabState _state       = TabState.Hidden;
     private float    _swoopTimer;
-    private Vector3  _swoopFromPos;
+    private float    _swoopStartY;
+    private Vector3  _originalScale;
     private Renderer _renderer;
+
+    // SmoothDamp state
+    private float _xVelocity = 0f;
+
+    // Exit gate: tab can only exit AFTER P2 has physically reached x <= exitXThreshold
+    private bool  _p2ReachedExitZone = false;
+    private float _p2PrevX           = float.MaxValue;
 
     // -------------------------------------------------------------------------
     //  Unity lifecycle
     // -------------------------------------------------------------------------
     void Start()
     {
-        _renderer = GetComponent<Renderer>();
-        // Hide visually but keep the GameObject active so Update() keeps running
+        _renderer      = GetComponent<Renderer>();
+        _originalScale = transform.localScale;
         SetVisible(false);
     }
 
@@ -119,12 +127,17 @@ public class DigitalTabController : MonoBehaviour
         float t      = Mathf.Clamp01(_swoopTimer / swoopDuration);
         float curved = swoopCurve.Evaluate(t);
 
-        Vector3 destination = new Vector3(GetHomeX(), tabFixedY, tabFixedZ);
-        transform.position  = Vector3.LerpUnclamped(_swoopFromPos, destination, curved);
+        Vector3 pos = transform.position;
+        pos.x = GetHomeX();
+        pos.y = Mathf.Lerp(_swoopStartY, tabFixedY, curved);
+        pos.z = tabFixedZ;
+        transform.position   = pos;
+        transform.localScale = Vector3.Lerp(Vector3.one * 0.01f, _originalScale, curved);
 
         if (t >= 1f)
         {
-            transform.position = destination;
+            transform.position   = new Vector3(GetHomeX(), tabFixedY, tabFixedZ);
+            transform.localScale = _originalScale;
             _state = TabState.AtWall;
         }
     }
@@ -135,8 +148,15 @@ public class DigitalTabController : MonoBehaviour
 
         if (person2Anchor == null || !person2Anchor.IsTracked) return;
 
-        if (GetFloorDistance() < wideProximity)
+        float p2x        = person2Anchor.transform.position.x;
+        bool  movingInward = p2x < _p2PrevX;
+        _p2PrevX = p2x;
+
+        if (movingInward && p2x < entryXThreshold)
+        {
+            _p2ReachedExitZone = false; // reset exit gate for new approach
             _state = TabState.FollowingP2;
+        }
     }
 
     private void HandleFollowingP2()
@@ -147,21 +167,29 @@ public class DigitalTabController : MonoBehaviour
             return;
         }
 
-        float dist = GetFloorDistance();
+        float p2x      = person2Anchor.transform.position.x;
+        bool  movingOut = p2x > _p2PrevX;
+        _p2PrevX = p2x;
 
-        if (dist < intimateProximity)
-        {
-            _state = TabState.AtMidpoint;
-            return;
-        }
+        // Gate: record when P2 has actually reached the exit zone
+        if (p2x <= exitXThreshold)
+            _p2ReachedExitZone = true;
 
-        if (dist > exitProximity)
+        // Exit only fires after P2 reached the exit zone and is now retreating past it
+        if (_p2ReachedExitZone && movingOut && p2x > exitXThreshold)
         {
             _state = TabState.ReturningHome;
             return;
         }
 
-        MoveToX(person2Anchor.transform.position.x);
+        // Enter intimate zone (pure position — direction not needed here)
+        if (p2x < intimateXThreshold)
+        {
+            _state = TabState.AtMidpoint;
+            return;
+        }
+
+        MoveToX(p2x);
     }
 
     private void HandleAtMidpoint()
@@ -172,21 +200,29 @@ public class DigitalTabController : MonoBehaviour
             return;
         }
 
-        float dist = GetFloorDistance();
+        float p2x      = person2Anchor.transform.position.x;
+        bool  movingOut = p2x > _p2PrevX;
+        _p2PrevX = p2x;
 
-        if (dist > exitProximity)
+        // Gate: record when P2 has reached the exit zone
+        if (p2x <= exitXThreshold)
+            _p2ReachedExitZone = true;
+
+        // Exit when P2 has been at exit zone and retreats past it
+        if (_p2ReachedExitZone && movingOut && p2x > exitXThreshold)
         {
             _state = TabState.ReturningHome;
             return;
         }
 
-        if (dist > intimateProximity)
+        // Return to following if P2 backs out of intimate zone
+        if (p2x > intimateXThreshold)
         {
             _state = TabState.FollowingP2;
             return;
         }
 
-        float midX = (GetSensorX() + person2Anchor.transform.position.x) * 0.5f;
+        float midX = (GetHomeX() + p2x) * 0.5f;
         MoveToX(midX);
     }
 
@@ -196,7 +232,10 @@ public class DigitalTabController : MonoBehaviour
         MoveToX(homeX);
 
         if (Mathf.Abs(transform.position.x - homeX) < 0.02f)
-            _state = TabState.AtWall;
+        {
+            _xVelocity = 0f;
+            _state     = TabState.AtWall;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -206,25 +245,26 @@ public class DigitalTabController : MonoBehaviour
     private void BeginSwoop()
     {
         SetVisible(true);
-        _swoopTimer   = 0f;
-        _swoopFromPos = swoopStartPoint != null
-            ? swoopStartPoint.position
-            : new Vector3(GetHomeX() - 5f, tabFixedY, tabFixedZ - 3f);
-        transform.position = _swoopFromPos;
+        _swoopTimer  = 0f;
+        _swoopStartY = tabFixedY - verticalRiseDistance;
+
+        transform.position   = new Vector3(GetHomeX(), _swoopStartY, tabFixedZ);
+        transform.localScale = Vector3.one * 0.01f;
+        _xVelocity           = 0f;
+
         _state = TabState.SwoopingIn;
     }
 
-    /// Move tab to target X; Y and Z are always locked
+    /// Moves the tab to a target X using SmoothDamp — organic bell-curve velocity
     private void MoveToX(float targetX)
     {
         Vector3 pos = transform.position;
-        pos.x = Mathf.Lerp(pos.x, targetX, moveSpeed * Time.deltaTime);
+        pos.x = Mathf.SmoothDamp(pos.x, targetX, ref _xVelocity, smoothTime, maxSpeed);
         pos.y = tabFixedY;
         pos.z = tabFixedZ;
         transform.position = pos;
     }
 
-    /// Home X = sensor X + homeXOffset
     private float GetHomeX()
     {
         if (person1Transform != null)
@@ -232,59 +272,36 @@ public class DigitalTabController : MonoBehaviour
         return transform.position.x;
     }
 
-    /// Show or hide the tab's visual without deactivating the GameObject
     private void SetVisible(bool visible)
     {
         if (_renderer != null) _renderer.enabled = visible;
     }
 
-    /// Raw sensor X (for midpoint calculation)
-    private float GetSensorX()
-    {
-        return person1Transform != null ? person1Transform.position.x : 0f;
-    }
-
-    /// Horizontal (floor-plane XZ) distance from sensor to P2
-    private float GetFloorDistance()
-    {
-        if (person1Transform == null || person2Anchor == null) return float.MaxValue;
-
-        Vector3 sensor = person1Transform.position;
-        Vector3 p2     = person2Anchor.transform.position;
-
-        return Vector2.Distance(new Vector2(sensor.x, sensor.z), new Vector2(p2.x, p2.z));
-    }
-
     // -------------------------------------------------------------------------
-    //  Scene-view gizmos (proximity rings around the sensor)
+    //  Scene-view gizmos — labelled vertical X threshold lines
     // -------------------------------------------------------------------------
 #if UNITY_EDITOR
     void OnDrawGizmosSelected()
     {
-        if (person1Transform == null) return;
-        Vector3 sensor = person1Transform.position;
+        float h = 3f;
+        float z = tabFixedZ;
 
-        Gizmos.color = new Color(0.2f, 0.8f, 0.2f, 0.4f);
-        DrawCircleGizmo(sensor, wideProximity);
+        Gizmos.color = new Color(0.2f, 0.9f, 0.2f, 0.8f);
+        Gizmos.DrawLine(new Vector3(entryXThreshold, 0f, z), new Vector3(entryXThreshold, h, z));
+        UnityEditor.Handles.Label(new Vector3(entryXThreshold, h, z), $"Entry  {entryXThreshold}");
 
-        Gizmos.color = new Color(1f, 0.8f, 0f, 0.4f);
-        DrawCircleGizmo(sensor, exitProximity);
+        Gizmos.color = new Color(1f, 0.2f, 0.2f, 0.8f);
+        Gizmos.DrawLine(new Vector3(intimateXThreshold, 0f, z), new Vector3(intimateXThreshold, h, z));
+        UnityEditor.Handles.Label(new Vector3(intimateXThreshold, h, z), $"Intimate  {intimateXThreshold}");
 
-        Gizmos.color = new Color(1f, 0.2f, 0.2f, 0.4f);
-        DrawCircleGizmo(sensor, intimateProximity);
-    }
+        Gizmos.color = new Color(1f, 0.85f, 0f, 0.8f);
+        Gizmos.DrawLine(new Vector3(exitXThreshold, 0f, z), new Vector3(exitXThreshold, h, z));
+        UnityEditor.Handles.Label(new Vector3(exitXThreshold, h, z), $"Exit  {exitXThreshold}");
 
-    private static void DrawCircleGizmo(Vector3 center, float radius)
-    {
-        const int segments = 64;
-        float     step     = 360f / segments;
-        for (int i = 0; i < segments; i++)
+        if (person1Transform != null)
         {
-            float a1   = i       * step * Mathf.Deg2Rad;
-            float a2   = (i + 1) * step * Mathf.Deg2Rad;
-            Vector3 from = center + new Vector3(Mathf.Cos(a1), 0f, Mathf.Sin(a1)) * radius;
-            Vector3 to   = center + new Vector3(Mathf.Cos(a2), 0f, Mathf.Sin(a2)) * radius;
-            Gizmos.DrawLine(from, to);
+            Gizmos.color = Color.white;
+            Gizmos.DrawWireSphere(new Vector3(GetHomeX(), tabFixedY, tabFixedZ), 0.08f);
         }
     }
 #endif
