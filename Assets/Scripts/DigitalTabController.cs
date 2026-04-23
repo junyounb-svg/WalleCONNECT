@@ -1,308 +1,270 @@
 using UnityEngine;
 
-/// <summary>
-/// Controls the Digital Swoop interaction:
-///
-///   SPACEBAR                          → Tab pops up beside the sensor (home).
-///   P2.x drops below entry (1.7)      → Tab follows P2 smoothly.
-///   P2.x drops below intimate (0.5)   → Tab moves to midpoint between home and P2.
-///   P2.x rises above exit (0) AFTER
-///     having reached x ≤ exit         → Tab returns home.
-///
-/// Movement uses SmoothDamp for an organic bell-curve velocity feel
-/// (slow start → fast mid → slow arrival).
-/// </summary>
 public class DigitalTabController : MonoBehaviour
 {
-    // -------------------------------------------------------------------------
-    //  Inspector
-    // -------------------------------------------------------------------------
-
-    [Header("Positions")]
-    [Tooltip("Empty GameObject at the CONNECT camera / sensor position (fixed)")]
-    public Transform person1Transform;
-
-    [Tooltip("PersonAnchor component on InvisibleAnchor_P2")]
+    // ── References ───────────────────────────────────────────────────────────
+    [Header("References")]
     public PersonAnchor person2Anchor;
+    public Transform    swoopOrigin;   // optional – sets swoop start Y
 
-    [Header("Tab Position")]
-    [Tooltip("Fixed Y height of the tab on the wall — never changes")]
-    public float tabFixedY = 1.5f;
+    // ── Tab Home Position ────────────────────────────────────────────────────
+    [Header("Tab Home Position")]
+    public float homeX = 0.03f;
+    public float tabY  = 1.5f;
+    public float wallZ = 2.32f;
 
-    [Tooltip("Fixed Z depth of the tab (wall plane Z value in world space)")]
-    public float tabFixedZ = 0f;
-
-    [Tooltip("X offset from the sensor for the home position")]
-    public float homeXOffset = 0.5f;
-
-    [Header("Movement Feel")]
-    [Tooltip("Approx time to reach target (seconds). Lower = snappier. Try 0.15 for 0.3-0.4 s reach")]
-    public float smoothTime = 0.15f;
-
-    [Tooltip("Maximum movement speed (units/sec) — caps the SmoothDamp velocity")]
-    public float maxSpeed = 20f;
-
+    // ── Swoop Animation ──────────────────────────────────────────────────────
     [Header("Swoop Animation")]
-    [Tooltip("How far below the resting position the tab starts its rise (metres)")]
-    public float verticalRiseDistance = 0.4f;
-
-    [Tooltip("Duration of the swoop-in animation in seconds")]
     public float swoopDuration = 0.4f;
 
-    [Tooltip("Easing curve for the swoop")]
-    public AnimationCurve swoopCurve = AnimationCurve.EaseInOut(0f, 0f, 1f, 1f);
+    // ── Proximity Thresholds (raw Z coordinates of each zone boundary) ───────
+    [Header("Proximity — raw Z position of each boundary")]
+    [Tooltip("Tab starts following when anchor.Z reaches this value")]
+    public float entryDist    = 1.7f;
 
-    [Header("Proximity Thresholds (World X Position)")]
-    [Tooltip("P2's X drops below this → tab starts following")]
-    public float entryXThreshold = 1.7f;
+    [Tooltip("(reserved for intimate zone — not active yet)")]
+    public float intimateDist = 0.5f;
 
-    [Tooltip("P2's X drops below this → tab moves to midpoint between home and P2")]
-    public float intimateXThreshold = 0.5f;
+    [Tooltip("(reserved for exit zone — not active yet)")]
+    public float exitDist     = 2.2f;
 
-    [Tooltip("Tab returns home only after P2 has reached this X and then retreats back above it")]
-    public float exitXThreshold = 0f;
+    // ── Following Offset ─────────────────────────────────────────────────────
+    [Header("Following Offset")]
+    [Tooltip("Z offset applied only while the tab is following/midpointing the anchor. " +
+             "Positive = push tab further from sensor. Negative = pull tab closer.")]
+    public float followZOffset = 0f;
 
-    // -------------------------------------------------------------------------
-    //  State machine
-    // -------------------------------------------------------------------------
-    private enum TabState
-    {
-        Hidden,
-        SwoopingIn,
-        AtWall,
-        FollowingP2,
-        AtMidpoint,
-        ReturningHome
-    }
+    // ── Following Feel ───────────────────────────────────────────────────────
+    [Header("Following Feel")]
+    [Tooltip("How quickly the tab snaps to the anchor's X (seconds). 0.1 ≈ arrives in ~0.3 s)")]
+    public float followSmoothTime = 0.10f;
 
-    private TabState _state       = TabState.Hidden;
-    private float    _swoopTimer;
-    private float    _swoopStartY;
-    private Vector3  _originalScale;
-    private Renderer _renderer;
+    [Tooltip("Maximum tab speed while following (units/sec)")]
+    public float followMaxSpeed   = 20f;
 
-    // SmoothDamp state
-    private float _xVelocity = 0f;
+    // ── Private ──────────────────────────────────────────────────────────────
+    private enum State { Hidden, SwoopingIn, AtWall, Following, Midpoint, Returning }
 
-    // Exit gate: tab can only exit AFTER P2 has physically reached x <= exitXThreshold
-    private bool  _p2ReachedExitZone = false;
-    private float _p2PrevX           = float.MaxValue;
+    private State    _state    = State.Hidden;
+    private Renderer _rend;
+    private Vector3  _origScale;
+    private float    _xVel;
+    private float    _swoopT;
+    private Vector3  _swoopFrom;
 
-    // -------------------------------------------------------------------------
-    //  Unity lifecycle
-    // -------------------------------------------------------------------------
+    // Exit crossing counter — first cross ignored, second cross → permanent home
+    private int   _exitCrossings  = 0;
+    private bool  _permanentHome  = false;
+    private float _prevAnchorZ    = float.MinValue;
+
+    // ── Unity lifecycle ───────────────────────────────────────────────────────
     void Start()
     {
-        _renderer      = GetComponent<Renderer>();
-        _originalScale = transform.localScale;
-        SetVisible(false);
+        _rend         = GetComponent<Renderer>();
+        _origScale    = transform.localScale;
+        _rend.enabled = false;
+        _state        = State.Hidden;
     }
 
     void Update()
     {
         switch (_state)
         {
-            case TabState.Hidden:        HandleHidden();        break;
-            case TabState.SwoopingIn:    HandleSwoopingIn();    break;
-            case TabState.AtWall:        HandleAtWall();        break;
-            case TabState.FollowingP2:   HandleFollowingP2();   break;
-            case TabState.AtMidpoint:    HandleAtMidpoint();    break;
-            case TabState.ReturningHome: HandleReturningHome(); break;
+            case State.Hidden:    DoHidden();    break;
+            case State.SwoopingIn:DoSwoop();     break;
+            case State.AtWall:    DoAtWall();    break;
+            case State.Following: DoFollowing(); break;
+            case State.Midpoint:  DoMidpoint();  break;
+            case State.Returning: DoReturning(); break;
         }
     }
 
-    // -------------------------------------------------------------------------
-    //  State handlers
-    // -------------------------------------------------------------------------
+    // ── State handlers ────────────────────────────────────────────────────────
 
-    private void HandleHidden()
+    void DoHidden()
     {
         if (Input.GetKeyDown(KeyCode.Space))
-            BeginSwoop();
+            StartSwoop();
     }
 
-    private void HandleSwoopingIn()
+    void DoSwoop()
     {
-        _swoopTimer += Time.deltaTime;
-        float t      = Mathf.Clamp01(_swoopTimer / swoopDuration);
-        float curved = swoopCurve.Evaluate(t);
+        _swoopT += Time.deltaTime / swoopDuration;
+        float t = Mathf.Clamp01(_swoopT);
+        float e = Mathf.SmoothStep(0f, 1f, t);
 
-        Vector3 pos = transform.position;
-        pos.x = GetHomeX();
-        pos.y = Mathf.Lerp(_swoopStartY, tabFixedY, curved);
-        pos.z = tabFixedZ;
-        transform.position   = pos;
-        transform.localScale = Vector3.Lerp(Vector3.one * 0.01f, _originalScale, curved);
+        Vector3 dest = new Vector3(homeX, tabY, wallZ);
+        transform.position   = Vector3.Lerp(_swoopFrom, dest, e);
+        transform.localScale = Vector3.Lerp(Vector3.one * 0.01f, _origScale, e);
 
         if (t >= 1f)
         {
-            transform.position   = new Vector3(GetHomeX(), tabFixedY, tabFixedZ);
-            transform.localScale = _originalScale;
-            _state = TabState.AtWall;
+            transform.position   = dest;
+            transform.localScale = _origScale;
+            _state = State.AtWall;
         }
     }
 
-    private void HandleAtWall()
+    void DoAtWall()
     {
-        MoveToX(GetHomeX());
+        LockPosition();
+
+        // Permanently home after second exit crossing — ignore all proximity
+        if (_permanentHome) return;
 
         if (person2Anchor == null || !person2Anchor.IsTracked) return;
 
-        float p2x        = person2Anchor.transform.position.x;
-        bool  movingInward = p2x < _p2PrevX;
-        _p2PrevX = p2x;
-
-        if (movingInward && p2x < entryXThreshold)
-        {
-            _p2ReachedExitZone = false; // reset exit gate for new approach
-            _state = TabState.FollowingP2;
-        }
+        if (person2Anchor.transform.position.z >= entryDist)
+            _state = State.Following;
     }
 
-    private void HandleFollowingP2()
+    void DoFollowing()
     {
+        // If tracking lost, snap back to AtWall
         if (person2Anchor == null || !person2Anchor.IsTracked)
         {
-            _state = TabState.ReturningHome;
+            _state = State.AtWall;
             return;
         }
 
-        float p2x      = person2Anchor.transform.position.x;
-        bool  movingOut = p2x > _p2PrevX;
-        _p2PrevX = p2x;
-
-        // Gate: record when P2 has actually reached the exit zone
-        if (p2x <= exitXThreshold)
-            _p2ReachedExitZone = true;
-
-        // Exit only fires after P2 reached the exit zone and is now retreating past it
-        if (_p2ReachedExitZone && movingOut && p2x > exitXThreshold)
+        // Enter intimate zone → go to midpoint
+        if (person2Anchor.transform.position.z >= intimateDist)
         {
-            _state = TabState.ReturningHome;
+            _state = State.Midpoint;
             return;
         }
 
-        // Enter intimate zone (pure position — direction not needed here)
-        if (p2x < intimateXThreshold)
-        {
-            _state = TabState.AtMidpoint;
-            return;
-        }
-
-        MoveToX(p2x);
-    }
-
-    private void HandleAtMidpoint()
-    {
-        if (person2Anchor == null || !person2Anchor.IsTracked)
-        {
-            _state = TabState.ReturningHome;
-            return;
-        }
-
-        float p2x      = person2Anchor.transform.position.x;
-        bool  movingOut = p2x > _p2PrevX;
-        _p2PrevX = p2x;
-
-        // Gate: record when P2 has reached the exit zone
-        if (p2x <= exitXThreshold)
-            _p2ReachedExitZone = true;
-
-        // Exit when P2 has been at exit zone and retreats past it
-        if (_p2ReachedExitZone && movingOut && p2x > exitXThreshold)
-        {
-            _state = TabState.ReturningHome;
-            return;
-        }
-
-        // Return to following if P2 backs out of intimate zone
-        if (p2x > intimateXThreshold)
-        {
-            _state = TabState.FollowingP2;
-            return;
-        }
-
-        float midX = (GetHomeX() + p2x) * 0.5f;
-        MoveToX(midX);
-    }
-
-    private void HandleReturningHome()
-    {
-        float homeX = GetHomeX();
-        MoveToX(homeX);
-
-        if (Mathf.Abs(transform.position.x - homeX) < 0.02f)
-        {
-            _xVelocity = 0f;
-            _state     = TabState.AtWall;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    //  Helpers
-    // -------------------------------------------------------------------------
-
-    private void BeginSwoop()
-    {
-        SetVisible(true);
-        _swoopTimer  = 0f;
-        _swoopStartY = tabFixedY - verticalRiseDistance;
-
-        transform.position   = new Vector3(GetHomeX(), _swoopStartY, tabFixedZ);
-        transform.localScale = Vector3.one * 0.01f;
-        _xVelocity           = 0f;
-
-        _state = TabState.SwoopingIn;
-    }
-
-    /// Moves the tab to a target X using SmoothDamp — organic bell-curve velocity
-    private void MoveToX(float targetX)
-    {
-        Vector3 pos = transform.position;
-        pos.x = Mathf.SmoothDamp(pos.x, targetX, ref _xVelocity, smoothTime, maxSpeed);
-        pos.y = tabFixedY;
-        pos.z = tabFixedZ;
+        // Smoothly move to match anchor's Z (plus inspector offset); X and Y are locked
+        float targetZ = person2Anchor.transform.position.z + followZOffset;
+        Vector3 pos   = transform.position;
+        pos.x = homeX;
+        pos.y = tabY;
+        pos.z = Mathf.SmoothDamp(pos.z, targetZ, ref _xVel, followSmoothTime, followMaxSpeed);
         transform.position = pos;
     }
 
-    private float GetHomeX()
+    void DoMidpoint()
     {
-        if (person1Transform != null)
-            return person1Transform.position.x + homeXOffset;
-        return transform.position.x;
+        if (person2Anchor == null || !person2Anchor.IsTracked)
+        {
+            _state = State.AtWall;
+            return;
+        }
+
+        float anchorZ = person2Anchor.transform.position.z;
+
+        // Detect each time the anchor crosses the exit threshold (either direction)
+        if (_prevAnchorZ != float.MinValue)
+        {
+            bool crossed = (_prevAnchorZ < exitDist) != (anchorZ < exitDist);
+            if (crossed)
+            {
+                _exitCrossings++;
+                if (_exitCrossings >= 2)
+                {
+                    // Second crossing → permanent home, never follow again
+                    _permanentHome = true;
+                    _prevAnchorZ   = anchorZ;
+                    _state = State.Returning;
+                    return;
+                }
+            }
+        }
+        _prevAnchorZ = anchorZ;
+
+        // Midpoint in Z between anchor and swoop origin (plus inspector offset)
+        float originZ = swoopOrigin != null ? swoopOrigin.transform.position.z : wallZ;
+        float targetZ = (anchorZ + originZ) * 0.5f + followZOffset;
+
+        Vector3 pos = transform.position;
+        pos.x = homeX;
+        pos.y = tabY;
+        pos.z = Mathf.SmoothDamp(pos.z, targetZ, ref _xVel, followSmoothTime, followMaxSpeed);
+        transform.position = pos;
     }
 
-    private void SetVisible(bool visible)
+    void DoReturning()
     {
-        if (_renderer != null) _renderer.enabled = visible;
+        // Smoothly bring tab back to home position (wallZ)
+        Vector3 pos = transform.position;
+        pos.x = homeX;
+        pos.y = tabY;
+        pos.z = Mathf.SmoothDamp(pos.z, wallZ, ref _xVel, followSmoothTime, followMaxSpeed);
+        transform.position = pos;
+
+        // Once close enough, settle at AtWall
+        if (Mathf.Abs(pos.z - wallZ) < 0.02f)
+        {
+            transform.position = new Vector3(homeX, tabY, wallZ);
+            _xVel  = 0f;
+            _state = State.AtWall;
+        }
     }
 
-    // -------------------------------------------------------------------------
-    //  Scene-view gizmos — labelled vertical X threshold lines
-    // -------------------------------------------------------------------------
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    void StartSwoop()
+    {
+        _rend.enabled  = true;
+        _swoopT        = 0f;
+        _xVel          = 0f;
+        _exitCrossings = 0;
+        _permanentHome = false;
+        _prevAnchorZ   = float.MinValue;
+        float startY   = swoopOrigin != null ? swoopOrigin.position.y : tabY - 0.5f;
+        _swoopFrom     = new Vector3(homeX, startY, wallZ);
+        transform.position   = _swoopFrom;
+        transform.localScale = Vector3.one * 0.01f;
+        _state = State.SwoopingIn;
+    }
+
+    /// Lock tab to home position.
+    void LockPosition()
+    {
+        transform.position = new Vector3(homeX, tabY, wallZ);
+    }
+
+    // ── Diagnostics (remove after confirming working) ─────────────────────────
+    private float _diagTimer;
+    void LateUpdate()
+    {
+        // Log every 0.5 s so console isn't flooded
+        _diagTimer += Time.deltaTime;
+        if (_diagTimer < 0.5f) return;
+        _diagTimer = 0f;
+
+        string anchorInfo;
+        if (person2Anchor == null)
+            anchorInfo = "ANCHOR IS NULL — drag InvisibleAnchor_P2 into Person2Anchor field!";
+        else
+            anchorInfo = $"tracked={person2Anchor.IsTracked} | anchorX={person2Anchor.transform.position.x:F3} | anchorZ={person2Anchor.transform.position.z:F3}";
+
+        Debug.Log($"[Tab] state={_state} | tabZ={transform.position.z:F3} | {anchorInfo} | entryDist={entryDist}");
+    }
+
+    // ── Scene-view gizmos ─────────────────────────────────────────────────────
 #if UNITY_EDITOR
     void OnDrawGizmosSelected()
     {
-        float h = 3f;
-        float z = tabFixedZ;
+        float cx = homeX;
+        float hw = 4f;
 
-        Gizmos.color = new Color(0.2f, 0.9f, 0.2f, 0.8f);
-        Gizmos.DrawLine(new Vector3(entryXThreshold, 0f, z), new Vector3(entryXThreshold, h, z));
-        UnityEditor.Handles.Label(new Vector3(entryXThreshold, h, z), $"Entry  {entryXThreshold}");
+        // Draw vertical marker lines at each raw Z boundary
+        DrawZLine(cx, hw, entryDist,    new Color(0.2f, 0.9f, 0.2f), $"Entry  Z={entryDist}");
+        DrawZLine(cx, hw, intimateDist, new Color(0.9f, 0.2f, 0.2f), $"Intimate  Z={intimateDist}");
+        DrawZLine(cx, hw, exitDist,     new Color(1f,   0.85f, 0f),  $"Exit  Z={exitDist}");
+        DrawZLine(cx, hw, wallZ,        Color.cyan,                  $"Wall  Z={wallZ}");
 
-        Gizmos.color = new Color(1f, 0.2f, 0.2f, 0.8f);
-        Gizmos.DrawLine(new Vector3(intimateXThreshold, 0f, z), new Vector3(intimateXThreshold, h, z));
-        UnityEditor.Handles.Label(new Vector3(intimateXThreshold, h, z), $"Intimate  {intimateXThreshold}");
+        Gizmos.color = Color.white;
+        Gizmos.DrawWireSphere(new Vector3(homeX, tabY, wallZ), 0.08f);
+    }
 
-        Gizmos.color = new Color(1f, 0.85f, 0f, 0.8f);
-        Gizmos.DrawLine(new Vector3(exitXThreshold, 0f, z), new Vector3(exitXThreshold, h, z));
-        UnityEditor.Handles.Label(new Vector3(exitXThreshold, h, z), $"Exit  {exitXThreshold}");
-
-        if (person1Transform != null)
-        {
-            Gizmos.color = Color.white;
-            Gizmos.DrawWireSphere(new Vector3(GetHomeX(), tabFixedY, tabFixedZ), 0.08f);
-        }
+    static void DrawZLine(float cx, float hw, float z, Color col, string label)
+    {
+        Gizmos.color = col;
+        Gizmos.DrawLine(new Vector3(cx - hw, 0f, z), new Vector3(cx + hw, 0f, z));
+        Gizmos.DrawLine(new Vector3(cx,      0f, z), new Vector3(cx,      2f, z));
+        UnityEditor.Handles.Label(new Vector3(cx + hw, 0.1f, z), label);
     }
 #endif
 }

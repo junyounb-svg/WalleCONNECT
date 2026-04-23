@@ -1,0 +1,309 @@
+using UnityEngine;
+
+/// <summary>
+/// Controls the Digital Swoop interaction:
+///
+///   SPACEBAR                                    → Tab pops up at home position on the wall.
+///   Person within entry distance of wall        → Tab follows person's X smoothly.
+///   Person within intimate distance of wall     → Tab moves to midpoint between home X and person X.
+///   Person retreats past exit distance          → Tab returns home.
+///
+/// Proximity is measured as the person's DISTANCE FROM THE WALL (|wallZ - person.Z|).
+/// This is always positive, always decreases as they approach, and works regardless
+/// of which direction they approach from. Tab movement is always on the X axis only.
+/// </summary>
+public class DigitalTabController : MonoBehaviour
+{
+    // -------------------------------------------------------------------------
+    //  Inspector
+    // -------------------------------------------------------------------------
+
+    [Header("Person Anchors")]
+    [Tooltip("Empty GameObject at the CONNECT camera / sensor position (fixed)")]
+    public Transform person1Transform;
+
+    [Tooltip("PersonAnchor component on InvisibleAnchor_P2")]
+    public PersonAnchor person2Anchor;
+
+    [Header("Tab Home Position (exact world coordinates)")]
+    [Tooltip("Exact X position the tab rests at after swooping")]
+    public float homeX = 0.03f;
+
+    [Tooltip("Exact Y height of the tab on the wall — never changes")]
+    public float tabFixedY = 1.5f;
+
+    [Header("Wall Z Coordinate")]
+    [Tooltip("The Z position of the wall surface. The tab always stays on this Z plane.")]
+    public float wallZ = 2.32f;
+
+    [Header("Movement Feel")]
+    [Tooltip("Approx time to reach target in seconds. Lower = snappier (0.15 ≈ 0.3-0.4 s reach)")]
+    public float smoothTime = 0.15f;
+
+    [Tooltip("Maximum movement speed (units/sec)")]
+    public float maxSpeed = 20f;
+
+    [Header("Swoop Animation")]
+    [Tooltip("The GameObject at the laptop/computer position — tab starts here")]
+    public Transform swoopStartPoint;
+
+    [Tooltip("Duration of the swoop-in animation in seconds")]
+    public float swoopDuration = 0.4f;
+
+    [Tooltip("Easing curve for the swoop")]
+    public AnimationCurve swoopCurve = AnimationCurve.EaseInOut(0f, 0f, 1f, 1f);
+
+    [Header("Axis")]
+    [Tooltip("Tick if person walks toward the wall along the Z axis (Brekel body moves in Z)")]
+    public bool proximityOnZAxis = false;
+
+    [Header("Proximity Thresholds (distance from wall in metres)")]
+    [Tooltip("Person within this distance → tab starts following their X")]
+    public float entryDistance = 1.7f;
+
+    [Tooltip("Person within this distance → tab moves to midpoint between home X and person X")]
+    public float intimateDistance = 0.5f;
+
+    [Tooltip("Person retreats beyond this distance → tab returns home. " +
+             "Set larger than entryDistance for hysteresis (e.g. 2.0)")]
+    public float exitDistance = 1.7f;
+
+    // -------------------------------------------------------------------------
+    //  State machine
+    // -------------------------------------------------------------------------
+    private enum TabState { Hidden, SwoopingIn, AtWall, FollowingP2, AtMidpoint, ReturningHome }
+
+    private TabState _state       = TabState.Hidden;
+    private float    _swoopTimer;
+    private Vector3  _swoopFromPos;
+    private Vector3  _originalScale;
+    private Renderer _renderer;
+    private float    _xVelocity = 0f;
+
+    // -------------------------------------------------------------------------
+    //  Unity lifecycle
+    // -------------------------------------------------------------------------
+    void Start()
+    {
+        _renderer      = GetComponent<Renderer>();
+        _originalScale = transform.localScale;
+        SetVisible(false);
+    }
+
+    void Update()
+    {
+        switch (_state)
+        {
+            case TabState.Hidden:        HandleHidden();        break;
+            case TabState.SwoopingIn:    HandleSwoopingIn();    break;
+            case TabState.AtWall:        HandleAtWall();        break;
+            case TabState.FollowingP2:   HandleFollowingP2();   break;
+            case TabState.AtMidpoint:    HandleAtMidpoint();    break;
+            case TabState.ReturningHome: HandleReturningHome(); break;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  State handlers
+    // -------------------------------------------------------------------------
+
+    private void HandleHidden()
+    {
+        if (Input.GetKeyDown(KeyCode.Space))
+            BeginSwoop();
+    }
+
+    private void HandleSwoopingIn()
+    {
+        _swoopTimer += Time.deltaTime;
+        float t      = Mathf.Clamp01(_swoopTimer / swoopDuration);
+        float curved = swoopCurve.Evaluate(t);
+
+        Vector3 destination = new Vector3(homeX, tabFixedY, wallZ);
+        transform.position   = Vector3.LerpUnclamped(_swoopFromPos, destination, curved);
+        transform.localScale = Vector3.Lerp(Vector3.one * 0.01f, _originalScale, curved);
+
+        if (t >= 1f)
+        {
+            transform.position   = destination;
+            transform.localScale = _originalScale;
+            _state = TabState.AtWall;
+        }
+    }
+
+    private void HandleAtWall()
+    {
+        MoveToX(homeX);
+
+        if (person2Anchor == null || !person2Anchor.IsTracked) return;
+
+        if (GetWallDistance() < entryDistance)
+            _state = TabState.FollowingP2;
+    }
+
+    private void HandleFollowingP2()
+    {
+        if (person2Anchor == null || !person2Anchor.IsTracked)
+        {
+            _state = TabState.ReturningHome;
+            return;
+        }
+
+        float dist = GetWallDistance();
+
+        if (dist > exitDistance)
+        {
+            _state = TabState.ReturningHome;
+            return;
+        }
+
+        if (dist < intimateDistance)
+        {
+            _state = TabState.AtMidpoint;
+            return;
+        }
+
+        // Follow person's X position along the wall
+        MoveToX(person2Anchor.transform.position.x);
+    }
+
+    private void HandleAtMidpoint()
+    {
+        if (person2Anchor == null || !person2Anchor.IsTracked)
+        {
+            _state = TabState.ReturningHome;
+            return;
+        }
+
+        float dist = GetWallDistance();
+
+        if (dist > exitDistance)
+        {
+            _state = TabState.ReturningHome;
+            return;
+        }
+
+        if (dist > intimateDistance)
+        {
+            _state = TabState.FollowingP2;
+            return;
+        }
+
+        // Midpoint between home X and person's current X
+        float midX = (homeX + person2Anchor.transform.position.x) * 0.5f;
+        MoveToX(midX);
+    }
+
+    private void HandleReturningHome()
+    {
+        MoveToX(homeX);
+
+        if (Mathf.Abs(transform.position.x - homeX) < 0.02f)
+        {
+            _xVelocity = 0f;
+            _state     = TabState.AtWall;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  Helpers
+    // -------------------------------------------------------------------------
+
+    private void BeginSwoop()
+    {
+        SetVisible(true);
+        _swoopTimer   = 0f;
+        float startY  = swoopStartPoint != null ? swoopStartPoint.position.y : tabFixedY - 0.4f;
+        _swoopFromPos = new Vector3(homeX, startY, wallZ);
+        transform.position   = _swoopFromPos;
+        transform.localScale = Vector3.one * 0.01f;
+        _xVelocity           = 0f;
+        _state = TabState.SwoopingIn;
+    }
+
+    /// Person's distance from the wall — always positive, decreases as they approach.
+    private float GetWallDistance()
+    {
+        if (person2Anchor == null) return float.MaxValue;
+        if (proximityOnZAxis)
+            return Mathf.Abs(wallZ - person2Anchor.transform.position.z);
+        return Mathf.Abs(homeX - person2Anchor.transform.position.x);
+    }
+
+    /// Move tab to target X using SmoothDamp. Y and Z are always locked.
+    private void MoveToX(float targetX)
+    {
+        Vector3 pos = transform.position;
+        pos.x = Mathf.SmoothDamp(pos.x, targetX, ref _xVelocity, smoothTime, maxSpeed);
+        pos.y = tabFixedY;
+        pos.z = wallZ;
+        transform.position = pos;
+    }
+
+    private void SetVisible(bool visible)
+    {
+        if (_renderer != null) _renderer.enabled = visible;
+    }
+
+    // Temporary live readout — remove after confirming the interaction works
+    private float _diagTimer;
+    void LateUpdate()
+    {
+        _diagTimer += Time.deltaTime;
+        if (_diagTimer < 0.5f) return;
+        _diagTimer = 0f;
+
+        bool  tracked = person2Anchor != null && person2Anchor.IsTracked;
+        float dist    = GetWallDistance();
+        float anchorZ = person2Anchor != null ? person2Anchor.transform.position.z : 0f;
+        Debug.Log($"[Tab] state={_state} | tracked={tracked} | anchorZ={anchorZ:F2} | wallDist={dist:F2} | entry={entryDistance}");
+    }
+
+
+    // -------------------------------------------------------------------------
+    //  Scene-view gizmos — horizontal lines at each distance from the wall
+    // -------------------------------------------------------------------------
+#if UNITY_EDITOR
+    void OnDrawGizmosSelected()
+    {
+        float cx = homeX;
+        float w  = 4f;
+
+        if (proximityOnZAxis)
+        {
+            // Draw lines at the Z positions corresponding to each distance from the wall
+            DrawZLine(cx, w, wallZ - entryDistance,    new Color(0.2f, 0.9f, 0.2f, 0.8f), $"Entry  {entryDistance}m from wall");
+            DrawZLine(cx, w, wallZ - intimateDistance, new Color(1f,   0.2f, 0.2f, 0.8f), $"Intimate  {intimateDistance}m from wall");
+            DrawZLine(cx, w, wallZ - exitDistance,     new Color(1f,   0.85f,0f,   0.8f), $"Exit  {exitDistance}m from wall");
+            // Also draw the wall itself
+            Gizmos.color = Color.cyan;
+            DrawZLine(cx, w, wallZ, Color.cyan, "Wall");
+        }
+        else
+        {
+            float h = 3f;
+            DrawXLine(h, wallZ, homeX - entryDistance,    new Color(0.2f, 0.9f, 0.2f, 0.8f), $"Entry  {entryDistance}");
+            DrawXLine(h, wallZ, homeX - intimateDistance, new Color(1f,   0.2f, 0.2f, 0.8f), $"Intimate  {intimateDistance}");
+            DrawXLine(h, wallZ, homeX - exitDistance,     new Color(1f,   0.85f,0f,   0.8f), $"Exit  {exitDistance}");
+        }
+
+        Gizmos.color = Color.white;
+        Gizmos.DrawWireSphere(new Vector3(homeX, tabFixedY, wallZ), 0.08f);
+    }
+
+    private static void DrawZLine(float cx, float hw, float z, Color col, string label)
+    {
+        Gizmos.color = col;
+        Gizmos.DrawLine(new Vector3(cx - hw, 0f, z), new Vector3(cx + hw, 0f, z));
+        Gizmos.DrawLine(new Vector3(cx,      0f, z), new Vector3(cx,      2f, z));
+        UnityEditor.Handles.Label(new Vector3(cx + hw, 0.1f, z), label);
+    }
+
+    private static void DrawXLine(float h, float z, float x, Color col, string label)
+    {
+        Gizmos.color = col;
+        Gizmos.DrawLine(new Vector3(x, 0f, z), new Vector3(x, h, z));
+        UnityEditor.Handles.Label(new Vector3(x, h, z), label);
+    }
+#endif
+}
